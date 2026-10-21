@@ -1,0 +1,212 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Helper functions for Users
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'username', 'usernameLower']) &&
+        data.uid is string && data.uid == request.auth.uid &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 100 &&
+        data.username is string && (data.username == '' || (data.username.size() >= 3 && data.username.size() <= 30 && data.username.matches('^[a-zA-Z0-9_]+$'))) &&
+        data.usernameLower is string && (data.usernameLower == '' || (data.usernameLower.size() >= 3 && data.usernameLower.size() <= 30 && data.usernameLower.matches('^[a-z0-9_]+$'))) &&
+        (!('bio' in data) || (data.bio is string && data.bio.size() <= 500)) &&
+        (!('email' in data) || (data.email is string && data.email.size() <= 200)) &&
+        (!('photoURL' in data) || (data.photoURL is string)) &&
+        (!('isOnline' in data) || (data.isOnline is bool)) &&
+        (!('settings' in data) || (data.settings is map));
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId);
+      // Allow searching for users without exposing full table scan
+      allow list: if isSignedIn();
+
+      allow create: if isOwner(userId) && isValidId(userId) && isValidUserProfile(request.resource.data);
+
+      allow update: if isOwner(userId) && isValidId(userId) && isValidUserProfile(request.resource.data) &&
+        request.resource.data.uid == resource.data.uid;
+
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      // Contacts Subcollection
+      match /contacts/{contactId} {
+        allow get, write: if isOwner(userId) && isValidId(contactId);
+        allow list: if isOwner(userId);
+      }
+
+      // Blocked Subcollection
+      match /blocked/{blockedId} {
+        allow get, write: if isOwner(userId) && isValidId(blockedId);
+        allow list: if isOwner(userId);
+      }
+
+      // Notifications Subcollection
+      match /notifications/{notificationId} {
+        allow get: if isOwner(userId) && isValidId(notificationId);
+        allow list: if isOwner(userId);
+        allow create: if isSignedIn() && isValidId(notificationId) && request.resource.data.userId == userId;
+        allow update, delete: if isOwner(userId) && isValidId(notificationId);
+      }
+    }
+
+    // Usernames Unique Reservation Index
+    match /usernames/{username} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isSignedIn() &&
+        username.size() >= 3 && username.size() <= 30 && username.matches('^[a-z0-9_]+$') &&
+        request.resource.data.uid == request.auth.uid &&
+        (!exists(/databases/$(database)/documents/usernames/$(username)) ||
+         get(/databases/$(database)/documents/usernames/$(username)).data.uid == request.auth.uid);
+      allow update: if isSignedIn() &&
+        request.resource.data.uid == request.auth.uid &&
+        resource.data.uid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // Email to Username/Profile Binding Index for seamless login with same Gmail
+    match /emails/{emailKey} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // Helper for Conversations
+    function isConversationParticipant(convData) {
+      return isSignedIn() && (request.auth.uid in convData.participantIds);
+    }
+
+    // Conversations
+    match /conversations/{conversationId} {
+      allow get: if isSignedIn() && isValidId(conversationId) &&
+        (conversationId.matches('.*' + request.auth.uid + '.*') || isConversationParticipant(resource.data));
+      allow list: if isSignedIn() && (request.auth.uid in resource.data.participantIds);
+
+      allow create: if isSignedIn() && isValidId(conversationId) &&
+        isConversationParticipant(request.resource.data) &&
+        request.resource.data.participantIds.size() >= 2 && request.resource.data.participantIds.size() <= 10;
+
+      allow update: if isSignedIn() && isValidId(conversationId) &&
+        (conversationId.matches('.*' + request.auth.uid + '.*') || isConversationParticipant(resource.data));
+
+      allow delete: if isSignedIn() && isValidId(conversationId) &&
+        (conversationId.matches('.*' + request.auth.uid + '.*') || isConversationParticipant(resource.data));
+
+      // Messages Subcollection
+      match /messages/{messageId} {
+        allow get: if isSignedIn() && isValidId(messageId) &&
+          (conversationId.matches('.*' + request.auth.uid + '.*') ||
+           (exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+            isConversationParticipant(get(/databases/$(database)/documents/conversations/$(conversationId)).data)));
+
+        allow list: if isSignedIn() &&
+          (conversationId.matches('.*' + request.auth.uid + '.*') ||
+           (exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+            isConversationParticipant(get(/databases/$(database)/documents/conversations/$(conversationId)).data)));
+
+        allow create: if isSignedIn() && isValidId(messageId) &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.resource.data.conversationId == conversationId &&
+          request.resource.data.type in ['text', 'image', 'file', 'system'] &&
+          (!('text' in request.resource.data) || request.resource.data.text.size() <= 4000) &&
+          (conversationId.matches('.*' + request.auth.uid + '.*') ||
+           (exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+            isConversationParticipant(get(/databases/$(database)/documents/conversations/$(conversationId)).data)));
+
+        // Edit or Delete own messages, or update read receipts
+        allow update: if isSignedIn() && isValidId(messageId) &&
+          (conversationId.matches('.*' + request.auth.uid + '.*') ||
+           (exists(/databases/$(database)/documents/conversations/$(conversationId)) &&
+            isConversationParticipant(get(/databases/$(database)/documents/conversations/$(conversationId)).data)));
+
+        allow delete: if isSignedIn() && isValidId(messageId) &&
+          (resource.data.senderId == request.auth.uid ||
+           conversationId.matches('.*' + request.auth.uid + '.*'));
+      }
+    }
+
+    // WebRTC Calls
+    function isCallParticipant(callData) {
+      return isSignedIn() && (request.auth.uid == callData.callerId || request.auth.uid == callData.receiverId);
+    }
+
+    match /calls/{callId} {
+      allow get: if isSignedIn() && isValidId(callId) && isCallParticipant(resource.data);
+      allow list: if isSignedIn() && (resource.data.callerId == request.auth.uid || resource.data.receiverId == request.auth.uid);
+
+      allow create: if isSignedIn() && isValidId(callId) &&
+        request.resource.data.callerId == request.auth.uid &&
+        request.resource.data.keys().hasAll(['callerId', 'receiverId', 'type', 'status', 'createdAt']) &&
+        request.resource.data.type in ['voice', 'video'];
+
+      allow update: if isSignedIn() && isValidId(callId) &&
+        isCallParticipant(resource.data);
+
+      allow delete: if isSignedIn() && isValidId(callId) && isCallParticipant(resource.data);
+
+      // WebRTC ICE Candidates
+      match /candidates/{candidateId} {
+        allow get: if isSignedIn() && isValidId(candidateId);
+        allow list: if isSignedIn();
+
+        allow create: if isSignedIn() && isValidId(candidateId) &&
+          request.resource.data.senderId == request.auth.uid;
+
+        allow delete: if isSignedIn() && isValidId(candidateId);
+      }
+    }
+
+    // User Moderation Reports
+    match /reports/{reportId} {
+      allow create: if isSignedIn() && isValidId(reportId) &&
+        request.resource.data.reporterId == request.auth.uid &&
+        request.resource.data.keys().hasAll(['reporterId', 'reportedUserId', 'reason', 'createdAt']);
+      allow read: if isSignedIn() && resource.data.reporterId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Friend Requests
+    match /friendRequests/{requestId} {
+      allow get: if isSignedIn() && (resource.data.senderId == request.auth.uid || resource.data.receiverId == request.auth.uid);
+      allow list: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.senderId == request.auth.uid;
+      allow update: if isSignedIn() && (resource.data.senderId == request.auth.uid || resource.data.receiverId == request.auth.uid);
+      allow delete: if isSignedIn() && (resource.data.senderId == request.auth.uid || resource.data.receiverId == request.auth.uid);
+    }
+
+    // For You Status Posts
+    match /statusPosts/{postId} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && resource.data.authorId == request.auth.uid;
+
+      // Status Comments Subcollection
+      match /comments/{commentId} {
+        allow get, list: if isSignedIn();
+        allow create: if isSignedIn() && request.resource.data.authorId == request.auth.uid;
+        allow delete: if isSignedIn() && (resource.data.authorId == request.auth.uid ||
+          get(/databases/$(database)/documents/statusPosts/$(postId)).data.authorId == request.auth.uid);
+      }
+    }
+  }
+}
